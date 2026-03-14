@@ -1,4 +1,4 @@
-# livrebotponte
+# Livre Bot Ponte
 Bot de ponte entre Matrix, Discord e Telegram
 Relay bot between Matrix, Discord and Telegram
 
