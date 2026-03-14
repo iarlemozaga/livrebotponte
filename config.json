@@ -1,0 +1,29 @@
+{
+    "matrix": {
+        "homeserver": "https://matrix.org",
+        "username": "@YOUR-USERNAME-BOT:matrix.org",
+        "password": "<YOUR LOGIN PASSWORD>"
+    },
+    "discord": {
+        "token": "<YOUR DISCORD BOT TOKEN>"
+    },
+    "telegram": {
+        "token": "<YOUR TELEGRAM BOT TOKEN>"
+    },
+    "bridges": [
+        {
+            "name": "One Server Bridge",
+            "matrix_room": "<MATRIX ROOM UNIQUE ID>",
+            "discord_channels": [<DISCORD CHANNEL ID>],
+            "telegram_chats": [<TELEGRAM CHAT ID>]
+        },
+        {
+            "name": "Another server bridge",
+            "matrix_room": "<MATRIX ROOM UNIQUE ID>",
+            "discord_channels": [<DISCORD CHANNEL ID>],
+            "telegram_chats": [<TELEGRAM CHAT ID>]
+        }
+
+    ],
+    "state_file": "bot_state.json"
+}
