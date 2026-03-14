@@ -1,0 +1,3 @@
+matrix-nio
+discord.py
+python-telegram-bot
