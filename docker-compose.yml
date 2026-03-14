@@ -1,0 +1,11 @@
+services:
+  matrix-bridge:
+    build: .
+    container_name: matrix-bridge
+    restart: unless-stopped
+    volumes:
+      - ./last_ts.txt:/app/last_ts.txt
+      - ./data:/app/data
+      - ./config.json:/app/config.json
+    environment:
+      - TZ=America/Sao_Paulo
