@@ -7,5 +7,7 @@ services:
       - ./last_ts.txt:/app/last_ts.txt
       - ./data:/app/data
       - ./config.json:/app/config.json
+      - ./bot_state.json:/app/bot_state.json
+      - ./message_map.json:/app/message_map.json
     environment:
       - TZ=America/Sao_Paulo
