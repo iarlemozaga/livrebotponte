@@ -2,6 +2,9 @@
 Bot de ponte entre Matrix, Discord e Telegram
 Relay bot between Matrix, Discord and Telegram
 
+OBS: A sala não pode estar com a criptografia ativada na sala da matrix
+NOTE: The room cannot have encryption enabled in the matrix's room
+
 ## Pré-requisitos
 
 - [Docker](https://docs.docker.com/get-docker/) e [Docker Compose](https://docs.docker.com/compose/install/) (recomendado) **ou** Python 3.11+.
