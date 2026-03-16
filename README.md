@@ -1,9 +1,9 @@
 # Livre Bot Ponte
-Bot de ponte entre Matrix, Discord e Telegram
-Relay bot between Matrix, Discord and Telegram
+- Bot de ponte entre Matrix, Discord e Telegram
+- Relay bot between Matrix, Discord and Telegram
 
-OBS: A sala não pode estar com a criptografia ativada na sala da matrix
-NOTE: The room cannot have encryption enabled in the matrix's room
+- OBS: A sala não pode estar com a criptografia ativada na sala da matrix
+- NOTE: The room cannot have encryption enabled in the matrix's room
 
 ## Pré-requisitos
 
