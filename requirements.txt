@@ -1,3 +1,5 @@
 matrix-nio
 discord.py
 python-telegram-bot
+sleekxmpp
+dnspython
