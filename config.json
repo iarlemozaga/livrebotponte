@@ -5,25 +5,34 @@
         "password": "<YOUR LOGIN PASSWORD>"
     },
     "discord": {
-        "token": "<YOUR DISCORD BOT TOKEN>"
+        "token": "<YOUR DISCORD BOT TOKEN>",
+        "use_webhook": true,
+        "webhook_name": "🌉 Bridge Bot"
     },
     "telegram": {
         "token": "<YOUR TELEGRAM BOT TOKEN>"
+    },
+    "xmpp": {
+        "jid": "bot@jabber.org",
+        "password": "<YOUR XMPP PASSWORD>",
+        "server": "jabber.org",
+        "port": 5222
     },
     "bridges": [
         {
             "name": "One Server Bridge",
             "matrix_room": "<MATRIX ROOM UNIQUE ID>",
             "discord_channels": [<DISCORD CHANNEL ID>],
-            "telegram_chats": [<TELEGRAM CHAT ID>]
+            "telegram_chats": [<TELEGRAM CHAT ID>],
+            "xmpp_rooms": []
         },
         {
             "name": "Another server bridge",
             "matrix_room": "<MATRIX ROOM UNIQUE ID>",
             "discord_channels": [<DISCORD CHANNEL ID>],
-            "telegram_chats": [<TELEGRAM CHAT ID>]
+            "telegram_chats": [<TELEGRAM CHAT ID>],
+            "xmpp_rooms": []
         }
-
     ],
     "state_file": "bot_state.json"
 }
