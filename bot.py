@@ -64,12 +64,17 @@ telegram_to_bridge = {}
 xmpp_to_bridge = {}
 
 for bridge in BRIDGES:
-    room_id = bridge['matrix_room']
-    matrix_to_bridge[room_id] = bridge
+    room_id = bridge.get('matrix_room')
+
+    if room_id:
+        matrix_to_bridge[room_id] = bridge
+
     for ch in bridge.get('discord_channels', []):
         discord_to_bridge[ch] = bridge
+
     for tg in bridge.get('telegram_chats', []):
         telegram_to_bridge[tg] = bridge
+
     for xmpp_room in bridge.get('xmpp_rooms', []):
         xmpp_to_bridge[xmpp_room] = bridge
 
@@ -94,7 +99,6 @@ def load_message_map():
         return {}
 
 def save_message_map(map_data):
-    # Remove entradas antigas (mais de 30 dias) para não acumular
     now = time.time()
     to_delete = []
     for k, v in map_data.items():
@@ -108,7 +112,6 @@ def save_message_map(map_data):
 # ================== FUNÇÕES DE REDE ROBUSTAS ==================
 
 async def matrix_login():
-    """Login com senha e retorno do client."""
     client = AsyncClient(MATRIX_HOMESERVER, MATRIX_USERNAME)
     try:
         resp = await client.login(MATRIX_PASSWORD)
@@ -123,7 +126,6 @@ async def matrix_login():
         return None
 
 async def download_file_http(url, output_path):
-    """Download HTTP simples (Discord/Telegram)."""
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=30) as resp:
@@ -140,31 +142,65 @@ async def download_file_http(url, output_path):
         return False
 
 async def download_matrix_file(client, url, output_path):
-    """Baixa arquivo do Matrix (mxc://). Versão CORRIGIDA."""
+    """Baixa arquivo do Matrix e garante que a extensão correta seja aplicada, ignorando .bin."""
     if not url.startswith('mxc://'):
         print(f"❌ [Matrix] download: URL inválida: {url}")
-        return False
+        return None
+
     parts = url[6:].split('/')
     server_name = parts[0]
     media_id = parts[1]
-    print(f"📥 [Matrix] download: iniciando {media_id} de {server_name}")
+
+    base_url = client.homeserver.rstrip('/')
+    headers = {"Authorization": f"Bearer {client.access_token}"}
+
+    print(f"📥 [Matrix] download: tentando HTTP Autenticado ({server_name}/{media_id})")
+
     try:
-        resp = await client.download(server_name, media_id, filename=str(output_path))
-        if output_path.exists() and output_path.stat().st_size > 0:
-            print(f"✅ [Matrix] download: arquivo salvo ({output_path.stat().st_size} bytes)")
-            return True
-        else:
-            print(f"❌ [Matrix] download: arquivo não criado ou vazio")
-            return False
+        async with aiohttp.ClientSession() as session:
+            v1_url = f"{base_url}/_matrix/client/v1/media/download/{server_name}/{media_id}"
+            resp = await session.get(v1_url, headers=headers)
+
+            if resp.status != 200:
+                v3_url = f"{base_url}/_matrix/media/v3/download/{server_name}/{media_id}"
+                resp = await session.get(v3_url, headers=headers)
+
+            if resp.status == 200:
+                content_type = resp.headers.get('Content-Type', '')
+                ext = mimetypes.guess_extension(content_type)
+
+                # Força a correção de extensões problemáticas ou genéricas
+                if ext == '.jpe':
+                    ext = '.jpg'
+                if not ext or ext == '.bin':
+                    if 'image/jpeg' in content_type: ext = '.jpg'
+                    elif 'image/png' in content_type: ext = '.png'
+                    elif 'image/gif' in content_type: ext = '.gif'
+                    elif 'image/webp' in content_type: ext = '.webp'
+                    elif 'video/mp4' in content_type: ext = '.mp4'
+                    elif 'audio/ogg' in content_type: ext = '.ogg'
+                    else: ext = ''
+
+                if ext and not output_path.endswith(ext):
+                    final_path = f"{output_path}{ext}"
+                else:
+                    final_path = output_path
+
+                with open(final_path, 'wb') as f:
+                    f.write(await resp.read())
+
+                print(f"✅ [Matrix] download concluído (Salvo como: {final_path})")
+                return final_path
+            else:
+                print(f"❌ [Matrix] falhou nos dois endpoints.")
+                return None
+
     except Exception as e:
-        print(f"❌ [Matrix] download: exceção: {e}")
-        return False
+        print(f"❌ [Matrix] exceção no download HTTP: {e}")
+        return None
 
 async def upload_to_matrix(file_path, filename, content_type):
-    """
-    Upload de arquivo para o Matrix.
-    Corrigido: passa filesize explicitamente e usa o arquivo corretamente.
-    """
+    """Upload de arquivo para o Matrix com tratamento de tuplas."""
     if not matrix_client or not matrix_client.access_token:
         print("❌ [Matrix] upload: cliente desconectado")
         return None
@@ -180,43 +216,77 @@ async def upload_to_matrix(file_path, filename, content_type):
     try:
         with open(file_path, 'rb') as f:
             resp = await matrix_client.upload(
-                data_provider=f,
+                f,
                 content_type=content_type,
                 filename=filename,
                 filesize=file_size
             )
+
+        if isinstance(resp, tuple):
+            resp = resp[0]
+
         if isinstance(resp, UploadResponse) and resp.content_uri:
             print(f"✅ [Matrix] upload: sucesso, URI: {resp.content_uri}")
             return resp.content_uri
         else:
             print(f"❌ [Matrix] upload: resposta inesperada: {resp}")
             return None
+
     except Exception as e:
         print(f"❌ [Matrix] upload: exceção: {e}")
         return None
 
-# ================== DISCORD WEBHOOKS (PUPPET) ==================
+async def upload_to_xmpp(file_path):
+    if not xmpp_client:
+        return None
+    try:
+        url = await xmpp_client['xep_0363'].upload_file(filename=str(file_path))
+        print(f"✅ [XMPP] Upload com sucesso: {url}")
+        return url
+    except IqError as e:
+        print(f"❌ [XMPP] IqError no Upload: {e.iq['error']['condition']} - {e.iq['error']['text']}")
+    except Exception as e:
+        print(f"❌ [XMPP] Erro genérico de Upload: {e}")
+    return None
+
+async def fetch_xmpp_media(url):
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.head(url, timeout=5) as resp:
+                ctype = resp.headers.get('Content-Type', '')
+                if ctype.startswith(('image/', 'video/', 'audio/')):
+                    ext = mimetypes.guess_extension(ctype.split(';')[0]) or ''
+                    fname = url.split('/')[-1].split('?')[0]
+                    fname = get_safe_filename(fname, ctype)
+                    fpath = TEMP_DIR / f"xmpp_dl_{int(time.time())}_{fname}"
+                    async with session.get(url, timeout=30) as get_resp:
+                        if get_resp.status == 200:
+                            with open(fpath, 'wb') as f:
+                                f.write(await get_resp.read())
+                            return fpath, fname, ctype
+    except Exception as e:
+        print(f"❌ [XMPP] Erro ao baixar mídia da URL {url}: {e}")
+    return None, None, None
+
+# ================== DISCORD WEBHOOKS ==================
 
 async def get_or_create_webhook(channel_id):
-    """Obtém ou cria webhook para um canal (estilo puppet)."""
     if channel_id in discord_webhooks:
         return discord_webhooks[channel_id]
-    
+
     channel = discord_client.get_channel(channel_id)
     if not channel:
         print(f"❌ [Discord] Canal {channel_id} não encontrado")
         return None
-    
+
     try:
         webhooks = await channel.webhooks()
-        # Procura webhook existente do bot
         for wh in webhooks:
             if wh.name == DISCORD_WEBHOOK_NAME:
                 discord_webhooks[channel_id] = wh
                 print(f"✅ [Discord] Webhook existente encontrado: {wh.id}")
                 return wh
-        
-        # Cria novo webhook
+
         wh = await channel.create_webhook(name=DISCORD_WEBHOOK_NAME)
         discord_webhooks[channel_id] = wh
         print(f"✅ [Discord] Webhook criado: {wh.id}")
@@ -226,20 +296,17 @@ async def get_or_create_webhook(channel_id):
         return None
 
 async def send_discord_webhook_message(channel_id, username, avatar_url, content=None, file=None, embeds=None):
-    """Envia mensagem via webhook (estilo puppet)."""
     webhook = await get_or_create_webhook(channel_id)
     if not webhook:
         return None
-    
+
     try:
-        msg = await webhook.send(
-            content=content,
-            username=username,
-            avatar_url=avatar_url,
-            file=file,
-            embeds=embeds,
-            wait=True
-        )
+        kwargs = {"content": content, "username": username, "wait": True}
+        if avatar_url: kwargs["avatar_url"] = avatar_url
+        if file: kwargs["file"] = file
+        if embeds: kwargs["embeds"] = embeds
+
+        msg = await webhook.send(**kwargs)
         print(f"✅ [Discord] Webhook enviado: {msg.id}")
         return msg
     except Exception as e:
@@ -247,6 +314,36 @@ async def send_discord_webhook_message(channel_id, username, avatar_url, content
         return None
 
 # ================== UTILITÁRIOS ==================
+
+def get_safe_filename(original_name, content_type=None):
+    """Garante que o arquivo temporário não contenha .bin e aplique a extensão certa."""
+    safe = "".join(c for c in original_name if c.isalnum() or c in ' ._-').rstrip()
+    if not safe:
+        safe = "file"
+
+    # Remove .bin do nome original enviado pelo cliente
+    if safe.lower().endswith('.bin'):
+        safe = safe[:-4]
+
+    if content_type:
+        ext = mimetypes.guess_extension(content_type.split(';')[0])
+        if ext == '.jpe':
+            ext = '.jpg'
+
+        # Força extensão se a biblioteca falhar ou retornar .bin genérico
+        if not ext or ext == '.bin':
+            if 'image/jpeg' in content_type: ext = '.jpg'
+            elif 'image/png' in content_type: ext = '.png'
+            elif 'image/gif' in content_type: ext = '.gif'
+            elif 'image/webp' in content_type: ext = '.webp'
+            elif 'video/mp4' in content_type: ext = '.mp4'
+            elif 'audio/ogg' in content_type: ext = '.ogg'
+            else: ext = ''
+
+        if ext and not safe.lower().endswith(ext.lower()):
+            safe += ext
+
+    return safe
 
 def get_matrix_display_name(room, user_id):
     if room and hasattr(room, 'users'):
@@ -259,39 +356,57 @@ def escape_html(text):
     return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
 def escape_discord_markdown(text):
-    """Escapa caracteres especiais do Discord."""
     return text.replace('*', '\\*').replace('_', '\\_').replace('`', '\\`').replace('~', '\\~')
 
 def markdown_to_html(text):
     return re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', text)
 
 def get_media_type(content_type):
-    """Retorna o tipo de mídia correto."""
-    if content_type.startswith('image/'):
-        return 'm.image'
-    elif content_type.startswith('video/'):
-        return 'm.video'
-    elif content_type.startswith('audio/'):
-        return 'm.audio'
-    else:
-        return 'm.file'
+    if content_type.startswith('image/'): return 'm.image'
+    elif content_type.startswith('video/'): return 'm.video'
+    elif content_type.startswith('audio/'): return 'm.audio'
+    else: return 'm.file'
 
 def get_telegram_media_method(content_type):
-    """Retorna o método correto de envio para Telegram."""
-    if content_type.startswith('image/'):
-        return 'send_photo'
-    elif content_type.startswith('video/') or content_type == 'application/x-matroska':
-        return 'send_video'
-    elif content_type.startswith('audio/'):
-        return 'send_audio'
-    else:
-        return 'send_document'
+    if content_type.startswith('image/'): return 'send_photo'
+    elif content_type.startswith('video/') or content_type == 'application/x-matroska': return 'send_video'
+    elif content_type.startswith('audio/'): return 'send_audio'
+    else: return 'send_document'
 
-# ================== EDIÇÕES ==================
+def send_xmpp_media(client, room, sender, url, text_body=""):
+    """Constrói e envia mensagem XMPP com suporte XHTML-IM e OOB para imagens nativas."""
+    if not client or not client.is_connected():
+        return
+    try:
+        msg = client.make_message(mto=room, mtype='groupchat')
+        mbody = f"{sender} enviou mídia: {url}"
+        if text_body:
+            mbody += f"\n{text_body}"
+        msg['body'] = mbody
+
+        # XHTML-IM para exibição direta da imagem
+        html_body = f"<p><b>{escape_html(sender)}</b> enviou mídia:<br/><a href='{url}'>{url}</a></p>"
+
+        # Injeta a tag img se for um formato visual compatível
+        if url.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp')):
+            html_body += f"<br/><img src='{url}' alt='Mídia recebida'/>"
+
+        if text_body:
+            html_body += f"<p>{escape_html(text_body)}</p>"
+
+        msg['html']['body'] = html_body
+
+        # OOB Data para clientes mais simples
+        msg['oob']['url'] = url
+
+        msg.send()
+    except Exception as e:
+        print(f"❌ [XMPP] Erro ao enviar mídia nativa: {e}")
+
+# ================== EDIÇÕES & DELEÇÕES ==================
 
 async def send_matrix_edit(room_id, event_id, new_content):
-    if not matrix_client or not matrix_client.access_token:
-        return
+    if not matrix_client or not matrix_client.access_token: return
     content = {
         "msgtype": "m.text",
         "body": f" * {new_content['body']}",
@@ -300,7 +415,6 @@ async def send_matrix_edit(room_id, event_id, new_content):
     }
     try:
         await matrix_client.room_send(room_id, "m.room.message", content)
-        print(f"✏️ [Matrix] Edição enviada para {event_id}")
     except Exception as e:
         print(f"❌ [Matrix] Erro ao editar: {e}")
 
@@ -310,44 +424,24 @@ async def send_discord_edit(channel_id, message_id, new_text):
         try:
             msg = await channel.fetch_message(message_id)
             await msg.edit(content=new_text)
-            print(f"✏️ [Discord] Mensagem {message_id} editada")
         except Exception as e:
             print(f"❌ [Discord] Erro ao editar: {e}")
 
 async def send_telegram_edit(chat_id, message_id, new_text):
     try:
-        await telegram_bot.edit_message_text(
-            chat_id=chat_id, message_id=message_id,
-            text=new_text, parse_mode=ParseMode.HTML
-        )
-        print(f"✏️ [Telegram] Mensagem {message_id} editada")
+        await telegram_bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=new_text, parse_mode=ParseMode.HTML)
     except Exception as e:
         print(f"❌ [Telegram] Erro ao editar: {e}")
 
-async def send_xmpp_edit(room_jid, message_id, new_text, author):
-    if not xmpp_client or not xmpp_client.is_connected():
-        return
-    try:
-        msg = xmpp_client.send_message(mto=room_jid, mbody=f"✏️ *{author}* editou: {new_text}", mtype='groupchat')
-        print(f"✏️ [XMPP] Mensagem editada em {room_jid}")
-    except Exception as e:
-        print(f"❌ [XMPP] Erro ao editar: {e}")
-
-# ================== DELEÇÕES (CROSS-DELETING) ==================
-
 async def handle_matrix_redaction(room: MatrixRoom, event: RedactionEvent):
-    if event.sender == matrix_client.user_id:
-        return
+    if event.sender == matrix_client.user_id: return
     redacts = event.redacts
-    if not redacts:
-        return
+    if not redacts: return
     msg_map = load_message_map()
-    if redacts not in msg_map:
-        return
+    if redacts not in msg_map: return
     target = msg_map[redacts]
     bridge = matrix_to_bridge.get(room.room_id)
-    if not bridge:
-        return
+    if not bridge: return
 
     if target['platform'] == 'discord':
         ch = discord_client.get_channel(target['channel_id'])
@@ -355,80 +449,46 @@ async def handle_matrix_redaction(room: MatrixRoom, event: RedactionEvent):
             try:
                 msg = await ch.fetch_message(target['message_id'])
                 await msg.delete()
-                print(f"🗑️ [Matrix -> Discord] Mensagem {target['message_id']} apagada")
-                del msg_map[redacts]
-                if str(target['message_id']) in msg_map:
-                    del msg_map[str(target['message_id'])]
-                save_message_map(msg_map)
-            except Exception as e:
-                print(f"❌ [Matrix -> Discord] Erro ao apagar: {e}")
+            except Exception: pass
     elif target['platform'] == 'telegram':
         try:
             await telegram_bot.delete_message(chat_id=target['chat_id'], message_id=target['message_id'])
-            print(f"🗑️ [Matrix -> Telegram] Mensagem {target['message_id']} apagada")
-            del msg_map[redacts]
-            if str(target['message_id']) in msg_map:
-                del msg_map[str(target['message_id'])]
-            save_message_map(msg_map)
-        except Exception as e:
-            print(f"❌ [Matrix -> Telegram] Erro ao apagar: {e}")
+        except Exception: pass
 
 @discord_client.event
 async def on_message_delete(message):
-    if message.author.id != discord_client.user.id:
-        return
+    if message.author.id != discord_client.user.id: return
     msg_map = load_message_map()
     msg_id_str = str(message.id)
-    if msg_id_str not in msg_map:
-        return
+    if msg_id_str not in msg_map: return
     target = msg_map[msg_id_str]
 
-    if target['platform'] == 'matrix':
-        if matrix_client and matrix_client.access_token:
-            try:
-                await matrix_client.room_redact(target['room_id'], target['event_id'])
-                print(f"🗑️ [Discord -> Matrix] Mensagem {target['event_id']} redacionada")
-                del msg_map[msg_id_str]
-                if target['event_id'] in msg_map:
-                    del msg_map[target['event_id']]
-                save_message_map(msg_map)
-            except Exception as e:
-                print(f"❌ [Discord -> Matrix] Erro ao redacionar: {e}")
+    if target['platform'] == 'matrix' and matrix_client:
+        try:
+            await matrix_client.room_redact(target['room_id'], target['event_id'])
+        except Exception: pass
     elif target['platform'] == 'telegram':
         try:
             await telegram_bot.delete_message(chat_id=target['chat_id'], message_id=target['message_id'])
-            print(f"🗑️ [Discord -> Telegram] Mensagem {target['message_id']} apagada")
-            del msg_map[msg_id_str]
-            if str(target['message_id']) in msg_map:
-                del msg_map[str(target['message_id'])]
-            save_message_map(msg_map)
-        except Exception as e:
-            print(f"❌ [Discord -> Telegram] Erro ao apagar: {e}")
+        except Exception: pass
 
 # ================== CALLBACK MATRIX ==================
 
 async def matrix_message_callback(room: MatrixRoom, event: RoomMessage):
-    # Filtros iniciais
-    if event.sender == matrix_client.user_id:
-        return
-    if room.room_id not in matrix_to_bridge:
-        return
+    if event.sender == matrix_client.user_id: return
+    if room.room_id not in matrix_to_bridge: return
     bridge = matrix_to_bridge[room.room_id]
 
-    # Ignora mensagens antigas via timestamp
     ts = getattr(event, 'server_timestamp', 0)
     state = load_state()
     last_ts = state.get('last_ts', {}).get(room.room_id, 0)
-    if ts <= last_ts:
-        print(f"⏭️ [Matrix] Mensagem antiga ignorada (ts={ts})")
-        return
+    if ts <= last_ts: return
     state['last_ts'][room.room_id] = ts
     save_state(state)
 
     content = getattr(event, 'source', {}).get('content', {})
     relates_to = content.get('m.relates_to', {})
 
-    # Se for edição, repassa
     if relates_to.get('rel_type') == 'm.replace':
         original = relates_to.get('event_id')
         new_body = content.get('m.new_content', {}).get('body', '')
@@ -436,137 +496,95 @@ async def matrix_message_callback(room: MatrixRoom, event: RoomMessage):
         if original in msg_map:
             target = msg_map[original]
             sender = get_matrix_display_name(room, event.sender)
-            print(f"✏️ [Matrix] Edição recebida para {original}")
             if target['platform'] == 'discord':
                 await send_discord_edit(target['channel_id'], target['message_id'], f"**{sender}:** {new_body}")
             elif target['platform'] == 'telegram':
                 await send_telegram_edit(target['chat_id'], target['message_id'], f"<b>{escape_html(sender)}:</b> {escape_html(new_body)}")
         return
 
-    # Se não for mensagem, ignora
-    if not isinstance(event, (RoomMessageText, RoomMessageEmote, RoomMessageNotice,
-                              RoomMessageImage, RoomMessageVideo, RoomMessageAudio,
-                              RoomMessageMedia, RoomMessageFile)):
+    if not isinstance(event, (RoomMessageText, RoomMessageEmote, RoomMessageNotice, RoomMessageImage, RoomMessageVideo, RoomMessageAudio, RoomMessageMedia, RoomMessageFile)):
         return
 
     sender_display = get_matrix_display_name(room, event.sender)
+    reply_to_event_id = relates_to.get('m.in_reply_to', {}).get('event_id')
 
-    # Processa reply original
-    reply_to_event_id = None
-    if 'm.in_reply_to' in relates_to:
-        reply_to_event_id = relates_to['m.in_reply_to'].get('event_id')
-
-    # Baixa mídia se houver
     file_path = None
     filename = None
     content_type = None
-    msgtype = None
     body_text = getattr(event, 'body', '')
 
     if isinstance(event, (RoomMessageImage, RoomMessageVideo, RoomMessageAudio, RoomMessageMedia, RoomMessageFile)):
         url = getattr(event, 'url', None)
         if url:
-            file_path = TEMP_DIR / f"matrix_{event.event_id}"
+            filename_raw = getattr(event, 'body', 'media') or f"media_{event.event_id}"
+            content_type = getattr(event, 'mimetype', 'application/octet-stream')
+
+            safe_fname = get_safe_filename(filename_raw, content_type)
+            file_path = TEMP_DIR / f"matrix_{event.event_id}_{safe_fname}"
+
             print(f"📥 [Matrix] Recebida mídia, baixando...")
-            if await download_matrix_file(matrix_client, url, file_path):
-                filename = getattr(event, 'body', 'media') or f"media_{event.event_id}"
-                content_type = getattr(event, 'mimetype', 'application/octet-stream')
-                msgtype = get_media_type(content_type)
-                if body_text:
-                    text_to_send = f"**{sender_display}:** {body_text}"
-                else:
-                    text_to_send = f"**{sender_display}** enviou um arquivo"
+
+            final_download_path = await download_matrix_file(matrix_client, url, str(file_path))
+            if final_download_path:
+                file_path = Path(final_download_path)
+                filename = file_path.name
+                text_to_send = f"**{sender_display}:** {body_text}" if body_text and body_text != filename_raw else f"**{sender_display}** enviou um arquivo"
             else:
                 text_to_send = f"**{sender_display}** enviou mídia (falha download)"
                 file_path = None
         else:
             text_to_send = f"**{sender_display}** enviou mídia sem URL"
     else:
-        # Mensagem de texto
         text_to_send = f"**{sender_display}:** {body_text}"
-        if isinstance(event, RoomMessageEmote):
-            text_to_send = f"* {sender_display} {body_text}"
-
-    if 'text_to_send' not in locals() and not file_path:
-        return
+        if isinstance(event, RoomMessageEmote): text_to_send = f"* {sender_display} {body_text}"
 
     msg_map = load_message_map()
+    reply_target_telegram = msg_map.get(reply_to_event_id, {}).get('message_id') if reply_to_event_id and msg_map.get(reply_to_event_id, {}).get('platform') == 'telegram' else None
 
-    # Busca reply alvo
-    reply_target_discord = None
-    reply_target_telegram = None
-    if reply_to_event_id and reply_to_event_id in msg_map:
-        tinfo = msg_map[reply_to_event_id]
-        if tinfo['platform'] == 'discord':
-            reply_target_discord = tinfo['message_id']
-        elif tinfo['platform'] == 'telegram':
-            reply_target_telegram = tinfo['message_id']
-
-    # Envia para Discord (via webhook)
+    # Envia para Discord
     for ch_id in bridge.get('discord_channels', []):
         try:
             if file_path and file_path.exists():
                 with open(file_path, 'rb') as f:
-                    discord_file = DiscordFile(f, filename=filename)
-                    sent = await send_discord_webhook_message(
-                        ch_id, 
-                        username=sender_display,
-                        avatar_url=None,
-                        content=text_to_send,
-                        file=discord_file
-                    )
+                    sent = await send_discord_webhook_message(ch_id, username=sender_display, avatar_url=None, content=text_to_send, file=DiscordFile(f, filename=filename))
             else:
-                sent = await send_discord_webhook_message(
-                    ch_id,
-                    username=sender_display,
-                    avatar_url=None,
-                    content=text_to_send
-                )
+                sent = await send_discord_webhook_message(ch_id, username=sender_display, avatar_url=None, content=text_to_send)
+
             if sent:
                 msg_map[event.event_id] = {'platform': 'discord', 'channel_id': ch_id, 'message_id': sent.id, 'ts': time.time()}
                 msg_map[str(sent.id)] = {'platform': 'matrix', 'room_id': room.room_id, 'event_id': event.event_id, 'ts': time.time()}
-                print(f"✅ [Matrix -> Discord] Mensagem {sent.id} enviada")
-        except Exception as e:
-            print(f"❌ [Matrix->Discord] Erro: {e}")
+        except Exception as e: print(f"❌ [Matrix->Discord] Erro: {e}")
 
     # Envia para Telegram
     for tg_id in bridge.get('telegram_chats', []):
         try:
             kwargs = {}
-            if reply_target_telegram:
-                kwargs['reply_to_message_id'] = reply_target_telegram
+            if reply_target_telegram: kwargs['reply_to_message_id'] = reply_target_telegram
             if file_path and file_path.exists():
                 with open(file_path, 'rb') as f:
                     method_name = get_telegram_media_method(content_type)
-                    if method_name == 'send_photo':
-                        sent = await telegram_bot.send_photo(chat_id=tg_id, photo=f, caption=markdown_to_html(text_to_send), parse_mode=ParseMode.HTML, **kwargs)
-                    elif method_name == 'send_video':
-                        sent = await telegram_bot.send_video(chat_id=tg_id, video=f, caption=markdown_to_html(text_to_send), parse_mode=ParseMode.HTML, **kwargs)
-                    elif method_name == 'send_audio':
-                        sent = await telegram_bot.send_audio(chat_id=tg_id, audio=f, caption=markdown_to_html(text_to_send), parse_mode=ParseMode.HTML, **kwargs)
-                    else:
-                        sent = await telegram_bot.send_document(chat_id=tg_id, document=f, caption=markdown_to_html(text_to_send), filename=filename, parse_mode=ParseMode.HTML, **kwargs)
+                    if method_name == 'send_photo': sent = await telegram_bot.send_photo(chat_id=tg_id, photo=f, caption=markdown_to_html(text_to_send), parse_mode=ParseMode.HTML, **kwargs)
+                    elif method_name == 'send_video': sent = await telegram_bot.send_video(chat_id=tg_id, video=f, caption=markdown_to_html(text_to_send), parse_mode=ParseMode.HTML, **kwargs)
+                    elif method_name == 'send_audio': sent = await telegram_bot.send_audio(chat_id=tg_id, audio=f, caption=markdown_to_html(text_to_send), parse_mode=ParseMode.HTML, **kwargs)
+                    else: sent = await telegram_bot.send_document(chat_id=tg_id, document=f, caption=markdown_to_html(text_to_send), filename=filename, parse_mode=ParseMode.HTML, **kwargs)
             else:
                 sent = await telegram_bot.send_message(chat_id=tg_id, text=markdown_to_html(text_to_send), parse_mode=ParseMode.HTML, **kwargs)
             msg_map[event.event_id] = {'platform': 'telegram', 'chat_id': tg_id, 'message_id': sent.message_id, 'ts': time.time()}
             msg_map[str(sent.message_id)] = {'platform': 'matrix', 'room_id': room.room_id, 'event_id': event.event_id, 'ts': time.time()}
-            print(f"✅ [Matrix -> Telegram] Mensagem {sent.message_id} enviada")
-        except Exception as e:
-            print(f"❌ [Matrix->Telegram] Erro: {e}")
+        except Exception as e: print(f"❌ [Matrix->Telegram] Erro: {e}")
 
     # Envia para XMPP
-    for xmpp_room in bridge.get('xmpp_rooms', []):
+    for xmpp_room in bridge.get("xmpp_rooms", []):
         try:
             if file_path and file_path.exists():
-                msg_text = f"{sender_display}: {text_to_send}\n[Arquivo: {filename}]"
+                xmpp_url = await upload_to_xmpp(file_path)
+                if xmpp_url:
+                    send_xmpp_media(xmpp_client, xmpp_room, sender_display, xmpp_url, body_text)
             else:
-                msg_text = text_to_send
-            xmpp_client.send_message(mto=xmpp_room, mbody=msg_text, mtype='groupchat')
-            print(f"✅ [Matrix -> XMPP] Mensagem enviada para {xmpp_room}")
+                xmpp_client.send_message(mto=xmpp_room, mbody=text_to_send, mtype="groupchat")
         except Exception as e:
             print(f"❌ [Matrix->XMPP] Erro: {e}")
 
-    # Limpeza
     if file_path and file_path.exists():
         file_path.unlink()
 
@@ -580,201 +598,100 @@ async def on_ready():
 
 @discord_client.event
 async def on_message(message):
-    # Ignora mensagens do bot e de webhooks
-    if message.author.id == discord_client.user.id or message.webhook_id:
-        return
-    if message.channel.id not in discord_to_bridge:
-        return
+    if message.author.id == discord_client.user.id or message.webhook_id: return
+    if message.channel.id not in discord_to_bridge: return
     bridge = discord_to_bridge[message.channel.id]
-
     author = message.author.display_name
 
-    # Reply
-    reply_to_msg_id = None
-    if message.reference and message.reference.resolved:
-        if isinstance(message.reference.resolved, discord.Message):
-            reply_to_msg_id = message.reference.resolved.id
+    reply_to_msg_id = message.reference.resolved.id if (message.reference and message.reference.resolved and isinstance(message.reference.resolved, discord.Message)) else None
 
     msg_map = load_message_map()
-    reply_target_matrix = None
-    reply_target_telegram = None
-    if reply_to_msg_id and str(reply_to_msg_id) in msg_map:
-        tinfo = msg_map[str(reply_to_msg_id)]
-        if tinfo['platform'] == 'matrix':
-            reply_target_matrix = tinfo['event_id']
-        elif tinfo['platform'] == 'telegram':
-            reply_target_telegram = tinfo['message_id']
+    reply_target_matrix = msg_map.get(str(reply_to_msg_id), {}).get('event_id') if reply_to_msg_id and msg_map.get(str(reply_to_msg_id), {}).get('platform') == 'matrix' else None
+    reply_target_telegram = msg_map.get(str(reply_to_msg_id), {}).get('message_id') if reply_to_msg_id and msg_map.get(str(reply_to_msg_id), {}).get('platform') == 'telegram' else None
 
-    # Stickers
-    if message.stickers:
-        for sticker in message.stickers:
-            ext = 'png'
-            content_type = 'image/png'
-            if sticker.format == discord.StickerFormatType.lottie:
-                ext = 'json'
-                content_type = 'application/json'
-            fpath = TEMP_DIR / f"sticker_{sticker.id}.{ext}"
-            print(f"📥 [Discord] Baixando sticker {sticker.id}")
-            if await download_file_http(sticker.url, fpath):
-                # Matrix
-                if matrix_client and matrix_client.access_token:
-                    mxc = await upload_to_matrix(fpath, sticker.name, content_type)
-                    if mxc:
-                        msgtype = 'm.image' if ext == 'png' else 'm.file'
-                        content = {
-                            "msgtype": msgtype,
-                            "body": f"Sticker: {sticker.name}",
-                            "url": mxc,
-                            "info": {"mimetype": content_type, "size": fpath.stat().st_size}
-                        }
-                        if reply_target_matrix:
-                            content['m.relates_to'] = {'m.in_reply_to': {'event_id': reply_target_matrix}}
-                        try:
-                            await matrix_client.room_send(bridge['matrix_room'], "m.room.message", content)
-                            print(f"✅ [Discord -> Matrix] Sticker enviado")
-                        except Exception as e:
-                            print(f"❌ [Discord -> Matrix] Erro sticker: {e}")
-                # Telegram
-                for tg_id in bridge.get('telegram_chats', []):
-                    try:
-                        with open(fpath, 'rb') as f:
-                            sent = await telegram_bot.send_document(
-                                chat_id=tg_id, document=f,
-                                caption=f"<b>{escape_html(author)}</b> enviou sticker",
-                                parse_mode=ParseMode.HTML,
-                                reply_to_message_id=reply_target_telegram
-                            )
-                        msg_map[str(sent.message_id)] = {'platform': 'discord', 'channel_id': message.channel.id, 'message_id': message.id, 'ts': time.time()}
-                        msg_map[str(message.id)] = {'platform': 'telegram', 'chat_id': tg_id, 'message_id': sent.message_id, 'ts': time.time()}
-                        print(f"✅ [Discord -> Telegram] Sticker enviado")
-                    except Exception as e:
-                        print(f"❌ [Discord -> Telegram] Erro sticker: {e}")
-                fpath.unlink()
-        save_message_map(msg_map)
-
-    # Attachments
-    elif message.attachments:
+    if message.attachments:
         for att in message.attachments:
-            fpath = TEMP_DIR / f"discord_{att.id}_{att.filename}"
-            print(f"📥 [Discord] Baixando attachment {att.filename}")
+            content_type = att.content_type or 'application/octet-stream'
+            safe_fname = get_safe_filename(att.filename, content_type)
+            fpath = TEMP_DIR / f"discord_{att.id}_{safe_fname}"
+
             if await download_file_http(att.url, fpath):
-                content_type = att.content_type or 'application/octet-stream'
                 msgtype = get_media_type(content_type)
-                
+
                 # Matrix
                 if matrix_client and matrix_client.access_token:
                     mxc = await upload_to_matrix(fpath, att.filename, content_type)
                     if mxc:
-                        content = {
-                            "msgtype": msgtype,
-                            "body": att.filename,
-                            "url": mxc,
-                            "info": {"mimetype": content_type, "size": fpath.stat().st_size}
-                        }
+                        content = {"msgtype": msgtype, "body": att.filename, "url": mxc, "info": {"mimetype": content_type, "size": fpath.stat().st_size}}
                         if message.content:
                             content['body'] = message.content
                             content['format'] = "org.matrix.custom.html"
                             content['formatted_body'] = f"<b>{author}:</b> {message.content}"
-                        if reply_target_matrix:
-                            content['m.relates_to'] = {'m.in_reply_to': {'event_id': reply_target_matrix}}
-                        try:
-                            await matrix_client.room_send(bridge['matrix_room'], "m.room.message", content)
-                            print(f"✅ [Discord -> Matrix] Mídia enviada")
-                        except Exception as e:
-                            print(f"❌ [Discord -> Matrix] Erro mídia: {e}")
-                
+                        if reply_target_matrix: content['m.relates_to'] = {'m.in_reply_to': {'event_id': reply_target_matrix}}
+                        try: await matrix_client.room_send(bridge['matrix_room'], "m.room.message", content)
+                        except Exception as e: print(f"❌ [Discord -> Matrix] Erro: {e}")
+
                 # Telegram
                 for tg_id in bridge.get('telegram_chats', []):
                     try:
                         with open(fpath, 'rb') as f:
-                            caption = f"<b>{escape_html(author)}</b>"
-                            if message.content:
-                                caption += f": {escape_html(message.content)}"
+                            caption = f"<b>{escape_html(author)}</b>" + (f": {escape_html(message.content)}" if message.content else "")
                             method_name = get_telegram_media_method(content_type)
-                            if method_name == 'send_photo':
-                                sent = await telegram_bot.send_photo(
-                                    chat_id=tg_id, photo=f, caption=caption,
-                                    parse_mode=ParseMode.HTML, reply_to_message_id=reply_target_telegram
-                                )
-                            elif method_name == 'send_video':
-                                sent = await telegram_bot.send_video(
-                                    chat_id=tg_id, video=f, caption=caption,
-                                    parse_mode=ParseMode.HTML, reply_to_message_id=reply_target_telegram
-                                )
-                            elif method_name == 'send_audio':
-                                sent = await telegram_bot.send_audio(
-                                    chat_id=tg_id, audio=f, caption=caption,
-                                    parse_mode=ParseMode.HTML, reply_to_message_id=reply_target_telegram
-                                )
-                            else:
-                                sent = await telegram_bot.send_document(
-                                    chat_id=tg_id, document=f, caption=caption, filename=att.filename,
-                                    parse_mode=ParseMode.HTML, reply_to_message_id=reply_target_telegram
-                                )
+                            if method_name == 'send_photo': sent = await telegram_bot.send_photo(chat_id=tg_id, photo=f, caption=caption, parse_mode=ParseMode.HTML, reply_to_message_id=reply_target_telegram)
+                            elif method_name == 'send_video': sent = await telegram_bot.send_video(chat_id=tg_id, video=f, caption=caption, parse_mode=ParseMode.HTML, reply_to_message_id=reply_target_telegram)
+                            elif method_name == 'send_audio': sent = await telegram_bot.send_audio(chat_id=tg_id, audio=f, caption=caption, parse_mode=ParseMode.HTML, reply_to_message_id=reply_target_telegram)
+                            else: sent = await telegram_bot.send_document(chat_id=tg_id, document=f, caption=caption, filename=att.filename, parse_mode=ParseMode.HTML, reply_to_message_id=reply_target_telegram)
                         msg_map[str(sent.message_id)] = {'platform': 'discord', 'channel_id': message.channel.id, 'message_id': message.id, 'ts': time.time()}
                         msg_map[str(message.id)] = {'platform': 'telegram', 'chat_id': tg_id, 'message_id': sent.message_id, 'ts': time.time()}
-                        print(f"✅ [Discord -> Telegram] Mídia enviada")
-                    except Exception as e:
-                        print(f"❌ [Discord -> Telegram] Erro mídia: {e}")
-                fpath.unlink()
-        save_message_map(msg_map)
+                    except Exception as e: print(f"❌ [Discord -> Telegram] Erro: {e}")
 
-    # Texto puro
+                # XMPP
+                for xmpp_room in bridge.get("xmpp_rooms", []):
+                    try:
+                        xmpp_url = await upload_to_xmpp(fpath)
+                        if xmpp_url:
+                            send_xmpp_media(xmpp_client, xmpp_room, author, xmpp_url, message.content)
+                    except Exception as e: print(f"❌ [Discord -> XMPP] Mídia erro: {e}")
+
+                fpath.unlink()
+
     elif message.content:
         text = f"**{author}:** {message.content}"
+
         # Matrix
         if matrix_client and matrix_client.access_token:
-            content = {
-                "msgtype": "m.text",
-                "body": text,
-                "format": "org.matrix.custom.html",
-                "formatted_body": markdown_to_html(text)
-            }
-            if reply_target_matrix:
-                content['m.relates_to'] = {'m.in_reply_to': {'event_id': reply_target_matrix}}
-            try:
-                await matrix_client.room_send(bridge['matrix_room'], "m.room.message", content)
-                print(f"✅ [Discord -> Matrix] Texto enviado")
-            except Exception as e:
-                print(f"❌ [Discord -> Matrix] Erro texto: {e}")
+            content = {"msgtype": "m.text", "body": text, "format": "org.matrix.custom.html", "formatted_body": markdown_to_html(text)}
+            if reply_target_matrix: content['m.relates_to'] = {'m.in_reply_to': {'event_id': reply_target_matrix}}
+            try: await matrix_client.room_send(bridge['matrix_room'], "m.room.message", content)
+            except Exception as e: pass
+
         # Telegram
         for tg_id in bridge.get('telegram_chats', []):
             try:
-                sent = await telegram_bot.send_message(
-                    chat_id=tg_id,
-                    text=f"<b>{escape_html(author)}:</b> {escape_html(message.content)}",
-                    parse_mode=ParseMode.HTML,
-                    reply_to_message_id=reply_target_telegram
-                )
+                sent = await telegram_bot.send_message(chat_id=tg_id, text=f"<b>{escape_html(author)}:</b> {escape_html(message.content)}", parse_mode=ParseMode.HTML, reply_to_message_id=reply_target_telegram)
                 msg_map[str(sent.message_id)] = {'platform': 'discord', 'channel_id': message.channel.id, 'message_id': message.id, 'ts': time.time()}
                 msg_map[str(message.id)] = {'platform': 'telegram', 'chat_id': tg_id, 'message_id': sent.message_id, 'ts': time.time()}
-                print(f"✅ [Discord -> Telegram] Texto enviado")
-            except Exception as e:
-                print(f"❌ [Discord -> Telegram] Erro texto: {e}")
-        save_message_map(msg_map)
+            except Exception as e: pass
+
+        # XMPP
+        for xmpp_room in bridge.get("xmpp_rooms", []):
+            try:
+                if xmpp_client and xmpp_client.is_connected():
+                    xmpp_client.send_message(mto=xmpp_room, mbody=f"{author}: {message.content}", mtype="groupchat")
+            except Exception as e: pass
+
+    save_message_map(msg_map)
 
 @discord_client.event
 async def on_message_edit(before, after):
-    if after.author.id == discord_client.user.id or after.webhook_id:
-        return
-    if before.content == after.content:
-        return
-    if after.channel.id not in discord_to_bridge:
-        return
-
+    if after.author.id == discord_client.user.id or after.webhook_id or before.content == after.content or after.channel.id not in discord_to_bridge: return
     msg_map = load_message_map()
     mid = str(after.id)
-    if mid not in msg_map:
-        return
+    if mid not in msg_map: return
     target = msg_map[mid]
 
-    if target['platform'] == 'matrix' and matrix_client and matrix_client.access_token:
-        new_content = {
-            "msgtype": "m.text",
-            "body": f"**{after.author.display_name}:** {after.content}",
-            "format": "org.matrix.custom.html",
-            "formatted_body": f"<b>{after.author.display_name}:</b> {after.content}"
-        }
+    if target['platform'] == 'matrix' and matrix_client:
+        new_content = {"msgtype": "m.text", "body": f"**{after.author.display_name}:** {after.content}", "format": "org.matrix.custom.html", "formatted_body": f"<b>{after.author.display_name}:</b> {after.content}"}
         await send_matrix_edit(target['room_id'], target['event_id'], new_content)
     elif target['platform'] == 'telegram':
         await send_telegram_edit(target['chat_id'], target['message_id'], f"<b>{escape_html(after.author.display_name)}:</b> {escape_html(after.content)}")
@@ -782,50 +699,24 @@ async def on_message_edit(before, after):
 # ================== CALLBACK TELEGRAM ==================
 
 async def telegram_message_callback(update: Update, context):
-    if not update.message:
-        return
+    if not update.message: return
     chat_id = update.effective_chat.id
-    if chat_id not in telegram_to_bridge:
-        return
+    if chat_id not in telegram_to_bridge: return
     bridge = telegram_to_bridge[chat_id]
 
-    user = update.effective_user
-    author = user.full_name or user.first_name
-
-    reply_id = None
-    if update.message.reply_to_message:
-        reply_id = update.message.reply_to_message.message_id
+    author = update.effective_user.full_name or update.effective_user.first_name
+    reply_id = update.message.reply_to_message.message_id if update.message.reply_to_message else None
 
     msg_map = load_message_map()
-    reply_target_matrix = None
-    reply_target_discord = None
-    if reply_id and str(reply_id) in msg_map:
-        tinfo = msg_map[str(reply_id)]
-        if tinfo['platform'] == 'matrix':
-            reply_target_matrix = tinfo['event_id']
-        elif tinfo['platform'] == 'discord':
-            reply_target_discord = tinfo['message_id']
+    reply_target_matrix = msg_map.get(str(reply_id), {}).get('event_id') if reply_id and msg_map.get(str(reply_id), {}).get('platform') == 'matrix' else None
 
-    # --- Processa mídia ---
     file_path = None
     caption = update.message.caption or ""
     filename = None
     content_type = None
     msgtype = None
 
-    if update.message.sticker:
-        s = update.message.sticker
-        file = await s.get_file()
-        ext = 'webm' if s.is_animated else 'webp'
-        content_type = 'video/webm' if s.is_animated else 'image/webp'
-        msgtype = 'm.video' if s.is_animated else 'm.image'
-        filename = f"sticker_{update.message.message_id}.{ext}"
-        file_path = TEMP_DIR / filename
-        await file.download_to_drive(file_path)
-        print(f"📥 [Telegram] Sticker baixado: {filename}")
-        caption = f"**{author}** enviou sticker"
-
-    elif update.message.photo:
+    if update.message.photo:
         p = update.message.photo[-1]
         file = await p.get_file()
         filename = f"photo_{update.message.message_id}.jpg"
@@ -833,18 +724,6 @@ async def telegram_message_callback(update: Update, context):
         await file.download_to_drive(file_path)
         content_type = 'image/jpeg'
         msgtype = 'm.image'
-        print(f"📥 [Telegram] Foto baixada: {filename}")
-
-    elif update.message.animation:  # GIF
-        a = update.message.animation
-        file = await a.get_file()
-        filename = a.file_name or f"anim_{update.message.message_id}.mp4"
-        file_path = TEMP_DIR / filename
-        await file.download_to_drive(file_path)
-        content_type = a.mime_type or 'video/mp4'
-        msgtype = 'm.video'
-        print(f"📥 [Telegram] GIF/Animação baixada: {filename}")
-
     elif update.message.video:
         v = update.message.video
         file = await v.get_file()
@@ -853,8 +732,6 @@ async def telegram_message_callback(update: Update, context):
         await file.download_to_drive(file_path)
         content_type = v.mime_type or 'video/mp4'
         msgtype = 'm.video'
-        print(f"📥 [Telegram] Vídeo baixado: {filename}")
-
     elif update.message.voice:
         v = update.message.voice
         file = await v.get_file()
@@ -863,129 +740,89 @@ async def telegram_message_callback(update: Update, context):
         await file.download_to_drive(file_path)
         content_type = v.mime_type or 'audio/ogg'
         msgtype = 'm.audio'
-        print(f"📥 [Telegram] Voz baixada: {filename}")
-
-    elif update.message.audio:
-        a = update.message.audio
-        file = await a.get_file()
-        filename = a.file_name or f"audio_{update.message.message_id}.mp3"
-        file_path = TEMP_DIR / filename
-        await file.download_to_drive(file_path)
-        content_type = a.mime_type or 'audio/mpeg'
-        msgtype = 'm.audio'
-        print(f"📥 [Telegram] Áudio baixado: {filename}")
-
     elif update.message.document:
         d = update.message.document
         file = await d.get_file()
-        filename = d.file_name or f"doc_{update.message.message_id}"
+        filename = d.file_name or f"doc_{update.message.message_id}.bin"
         file_path = TEMP_DIR / filename
         await file.download_to_drive(file_path)
         content_type = d.mime_type or 'application/octet-stream'
         msgtype = 'm.file'
-        print(f"📥 [Telegram] Documento baixado: {filename}")
 
     if file_path and file_path.exists():
         # Matrix
         if matrix_client and matrix_client.access_token:
             mxc = await upload_to_matrix(file_path, filename, content_type)
             if mxc:
-                content = {
-                    "msgtype": msgtype,
-                    "body": caption or filename,
-                    "url": mxc,
-                    "info": {"mimetype": content_type, "size": file_path.stat().st_size}
-                }
+                content = {"msgtype": msgtype, "body": caption or filename, "url": mxc, "info": {"mimetype": content_type, "size": file_path.stat().st_size}}
                 if caption:
                     content['body'] = caption
                     content['format'] = "org.matrix.custom.html"
                     content['formatted_body'] = markdown_to_html(caption)
-                if reply_target_matrix:
-                    content['m.relates_to'] = {'m.in_reply_to': {'event_id': reply_target_matrix}}
-                try:
-                    await matrix_client.room_send(bridge['matrix_room'], "m.room.message", content)
-                    print(f"✅ [Telegram -> Matrix] Mídia enviada")
-                except Exception as e:
-                    print(f"❌ [Telegram->Matrix] Erro envio: {e}")
+                if reply_target_matrix: content['m.relates_to'] = {'m.in_reply_to': {'event_id': reply_target_matrix}}
+                try: await matrix_client.room_send(bridge['matrix_room'], "m.room.message", content)
+                except Exception as e: print(f"❌ [Telegram->Matrix] Erro: {e}")
 
-        # Discord (via webhook)
+        # Discord
         for ch_id in bridge.get('discord_channels', []):
             try:
                 with open(file_path, 'rb') as f:
-                    discord_file = DiscordFile(f, filename=filename)
-                    sent = await send_discord_webhook_message(
-                        ch_id,
-                        username=author,
-                        avatar_url=None,
-                        content=f"{caption}",
-                        file=discord_file
-                    )
+                    sent = await send_discord_webhook_message(ch_id, username=author, avatar_url=None, content=f"{caption}", file=DiscordFile(f, filename=filename))
                     if sent:
                         msg_map[str(sent.id)] = {'platform': 'telegram', 'chat_id': chat_id, 'message_id': update.message.message_id, 'ts': time.time()}
                         msg_map[str(update.message.message_id)] = {'platform': 'discord', 'channel_id': ch_id, 'message_id': sent.id, 'ts': time.time()}
-                        print(f"✅ [Telegram -> Discord] Mídia enviada")
-            except Exception as e:
-                print(f"❌ [Telegram->Discord] Erro: {e}")
+            except Exception as e: print(f"❌ [Telegram->Discord] Erro: {e}")
+
+        # XMPP
+        for xmpp_room in bridge.get("xmpp_rooms", []):
+            try:
+                xmpp_url = await upload_to_xmpp(file_path)
+                if xmpp_url:
+                    send_xmpp_media(xmpp_client, xmpp_room, author, xmpp_url, caption)
+            except Exception as e: print(f"❌ [Telegram -> XMPP] Erro mídia: {e}")
+
         file_path.unlink()
 
-    # Texto puro
     elif update.message.text:
         text = f"**{author}:** {update.message.text}"
+
         # Matrix
         if matrix_client and matrix_client.access_token:
-            content = {
-                "msgtype": "m.text",
-                "body": text,
-                "format": "org.matrix.custom.html",
-                "formatted_body": markdown_to_html(text)
-            }
-            if reply_target_matrix:
-                content['m.relates_to'] = {'m.in_reply_to': {'event_id': reply_target_matrix}}
-            try:
-                await matrix_client.room_send(bridge['matrix_room'], "m.room.message", content)
-                print(f"✅ [Telegram -> Matrix] Texto enviado")
-            except Exception as e:
-                print(f"❌ [Telegram->Matrix] Erro texto: {e}")
-        # Discord (via webhook)
+            content = {"msgtype": "m.text", "body": text, "format": "org.matrix.custom.html", "formatted_body": markdown_to_html(text)}
+            if reply_target_matrix: content['m.relates_to'] = {'m.in_reply_to': {'event_id': reply_target_matrix}}
+            try: await matrix_client.room_send(bridge['matrix_room'], "m.room.message", content)
+            except Exception: pass
+
+        # Discord
         for ch_id in bridge.get('discord_channels', []):
             try:
-                sent = await send_discord_webhook_message(
-                    ch_id,
-                    username=author,
-                    avatar_url=None,
-                    content=update.message.text
-                )
+                sent = await send_discord_webhook_message(ch_id, username=author, avatar_url=None, content=update.message.text)
                 if sent:
                     msg_map[str(sent.id)] = {'platform': 'telegram', 'chat_id': chat_id, 'message_id': update.message.message_id, 'ts': time.time()}
                     msg_map[str(update.message.message_id)] = {'platform': 'discord', 'channel_id': ch_id, 'message_id': sent.id, 'ts': time.time()}
-                    print(f"✅ [Telegram -> Discord] Texto enviado")
-            except Exception as e:
-                print(f"❌ [Telegram -> Discord] Erro: {e}")
+            except Exception: pass
+
+        # XMPP
+        for xmpp_room in bridge.get("xmpp_rooms", []):
+            try:
+                if xmpp_client and xmpp_client.is_connected():
+                    xmpp_client.send_message(mto=xmpp_room, mbody=f"{author}: {update.message.text}", mtype="groupchat")
+            except Exception: pass
 
     save_message_map(msg_map)
 
 async def telegram_edit_callback(update: Update, context):
-    if not update.edited_message:
-        return
+    if not update.edited_message: return
     msg = update.edited_message
-    chat_id = update.effective_chat.id
-    if chat_id not in telegram_to_bridge:
-        return
+    if update.effective_chat.id not in telegram_to_bridge: return
     msg_map = load_message_map()
     mid = str(msg.message_id)
-    if mid not in msg_map:
-        return
+    if mid not in msg_map: return
     target = msg_map[mid]
-    user = msg.from_user
-    author = user.full_name or user.first_name
+    author = msg.from_user.full_name or msg.from_user.first_name
 
-    if target['platform'] == 'matrix' and matrix_client and matrix_client.access_token:
-        new_content = {
-            "msgtype": "m.text",
-            "body": f"**{author}:** {msg.text}",
-            "format": "org.matrix.custom.html",
-            "formatted_body": f"<b>{author}:</b> {msg.text}"
-        }
+    if target['platform'] == 'matrix' and matrix_client:
+        new_content = {"msgtype": "m.text", "body": f"**{author}:** {msg.text}", "format": "org.matrix.custom.html", "formatted_body": f"<b>{author}:</b> {msg.text}"}
         await send_matrix_edit(target['room_id'], target['event_id'], new_content)
     elif target['platform'] == 'discord':
         await send_discord_edit(target['channel_id'], target['message_id'], f"**{author}:** {msg.text}")
@@ -999,9 +836,14 @@ class XMPPClient(slixmpp.ClientXMPP):
     def __init__(self, jid, password, bridges):
         super().__init__(jid, password)
         self.bridges = bridges
-        self.register_plugin('xep_0030')  # Service Discovery
-        self.register_plugin('xep_0045')  # Multi-User Chat
-        self.register_plugin('xep_0199')  # XMPP Ping
+        self.register_plugin('xep_0030')
+        self.register_plugin('xep_0045')
+        self.register_plugin('xep_0066') # Out of Band Data para Mídia
+        self.register_plugin('xep_0071') # XHTML-IM para exibição de imagens
+        self.register_plugin('xep_0199')
+        self.register_plugin("xep_0004")
+        self.register_plugin("xep_0249")
+        self.register_plugin("xep_0363")
 
         self.add_event_handler("session_start", self.start)
         self.add_event_handler("groupchat_message", self.handle_group_message)
@@ -1009,94 +851,104 @@ class XMPPClient(slixmpp.ClientXMPP):
     async def start(self, event):
         self.send_presence()
         await self.get_roster()
-        
-        # Entra nas salas XMPP
+
         for bridge in self.bridges:
             for room in bridge.get('xmpp_rooms', []):
                 try:
-                    self['xep_0045'].join_muc(room, XMPP_JID.split('@')[0])
+                    await asyncio.to_thread(self.plugin['xep_0045'].join_muc, room, XMPP_JID.split('@')[0])
                     print(f"✅ [XMPP] Entrou em {room}")
                 except Exception as e:
                     print(f"❌ [XMPP] Erro ao entrar em {room}: {e}")
 
     async def handle_group_message(self, msg):
-        if msg['type'] in ('chat', 'normal'):
-            return
-        
-        room = msg['from'].bare
-        sender = msg['from'].resource or msg['from'].bare
-        body = msg['body']
-        
-        if not body:
-            return
+        if msg["type"] != "groupchat": return
+        room = msg["from"].bare
+        sender = msg["mucnick"]
 
-        bridge = None
-        for b in self.bridges:
-            if room in b.get('xmpp_rooms', []):
-                bridge = b
-                break
-        
-        if not bridge:
-            return
+        if sender == XMPP_JID.split("@")[0]: return
+        body = msg["body"]
+        if not body: return
 
-        text = f"**{sender}:** {body}"
-        msg_map = load_message_map()
+        bridge = next((b for b in self.bridges if room in b.get("xmpp_rooms", [])), None)
+        if not bridge: return
 
-        # Envia para Matrix
-        if matrix_client and matrix_client.access_token:
-            content = {
-                "msgtype": "m.text",
-                "body": text,
-                "format": "org.matrix.custom.html",
-                "formatted_body": markdown_to_html(text)
-            }
+        urls = re.findall(r'(https?://[^\s]+)', body)
+        media_files = []
+        if urls:
+            results = await asyncio.gather(*(fetch_xmpp_media(u) for u in urls))
+            media_files = [r for r in results if r[0] is not None]
+
+        body_stripped = body
+        for u in urls: body_stripped = body_stripped.replace(u, '').strip()
+        is_only_urls = (body_stripped == "" and len(media_files) > 0)
+
+        # ---------- Matrix ----------
+        if matrix_client and matrix_client.access_token and bridge.get("matrix_room"):
             try:
-                await matrix_client.room_send(bridge['matrix_room'], "m.room.message", content)
-                print(f"✅ [XMPP -> Matrix] Mensagem enviada")
-            except Exception as e:
-                print(f"❌ [XMPP -> Matrix] Erro: {e}")
+                if media_files:
+                    for fpath, fname, ctype in media_files:
+                        mxc = await upload_to_matrix(fpath, fname, ctype)
+                        if mxc:
+                            content = {"msgtype": get_media_type(ctype), "body": fname, "url": mxc, "info": {"mimetype": ctype, "size": fpath.stat().st_size}}
+                            await matrix_client.room_send(bridge["matrix_room"], "m.room.message", content)
 
-        # Envia para Discord
-        for ch_id in bridge.get('discord_channels', []):
-            try:
-                sent = await send_discord_webhook_message(
-                    ch_id,
-                    username=sender,
-                    avatar_url=None,
-                    content=body
-                )
-                if sent:
-                    print(f"✅ [XMPP -> Discord] Mensagem enviada")
-            except Exception as e:
-                print(f"❌ [XMPP -> Discord] Erro: {e}")
+                if not is_only_urls:
+                    text = f"**{sender}:** {body}"
+                    content = {"msgtype": "m.text", "body": text, "format": "org.matrix.custom.html", "formatted_body": markdown_to_html(text)}
+                    await matrix_client.room_send(bridge["matrix_room"], "m.room.message", content)
+            except Exception as e: print(f"❌ [XMPP -> Matrix] {e}")
 
-        # Envia para Telegram
-        for tg_id in bridge.get('telegram_chats', []):
+        # ---------- Discord ----------
+        for ch_id in bridge.get("discord_channels", []):
             try:
-                sent = await telegram_bot.send_message(
-                    chat_id=tg_id,
-                    text=f"<b>{escape_html(sender)}:</b> {escape_html(body)}",
-                    parse_mode=ParseMode.HTML
-                )
-                print(f"✅ [XMPP -> Telegram] Mensagem enviada")
-            except Exception as e:
-                print(f"❌ [XMPP -> Telegram] Erro: {e}")
+                if media_files:
+                    first_file = True
+                    for fpath, fname, ctype in media_files:
+                        with open(fpath, 'rb') as f:
+                            await send_discord_webhook_message(
+                                channel_id=ch_id, username=sender, avatar_url=None,
+                                content=body if first_file and not is_only_urls else "",
+                                file=DiscordFile(f, filename=fname)
+                            )
+                        first_file = False
+                elif not is_only_urls:
+                    await send_discord_webhook_message(channel_id=ch_id, username=sender, avatar_url=None, content=body)
+            except Exception as e: print(f"❌ [XMPP -> Discord] {e}")
+
+        # ---------- Telegram ----------
+        for tg_id in bridge.get("telegram_chats", []):
+            try:
+                if media_files:
+                    first_file = True
+                    for fpath, fname, ctype in media_files:
+                        with open(fpath, 'rb') as f:
+                            m = get_telegram_media_method(ctype)
+                            caption = f"<b>{escape_html(sender)}</b>: {escape_html(body)}" if first_file and not is_only_urls else ""
+                            if m == 'send_photo': await telegram_bot.send_photo(chat_id=tg_id, photo=f, caption=caption, parse_mode=ParseMode.HTML)
+                            elif m == 'send_video': await telegram_bot.send_video(chat_id=tg_id, video=f, caption=caption, parse_mode=ParseMode.HTML)
+                            elif m == 'send_audio': await telegram_bot.send_audio(chat_id=tg_id, audio=f, caption=caption, parse_mode=ParseMode.HTML)
+                            else: await telegram_bot.send_document(chat_id=tg_id, document=f, caption=caption, parse_mode=ParseMode.HTML)
+                        first_file = False
+                elif not is_only_urls:
+                    await telegram_bot.send_message(chat_id=tg_id, text=f"<b>{escape_html(sender)}</b>: {escape_html(body)}", parse_mode=ParseMode.HTML)
+            except Exception as e: print(f"❌ [XMPP -> Telegram] {e}")
+
+        # Cleanup
+        for fpath, _, _ in media_files:
+            if fpath.exists(): fpath.unlink()
 
 async def run_xmpp_client():
-    """Inicia e mantém conexão com XMPP."""
     global xmpp_client
-    while True:
-        try:
-            xmpp_client = XMPPClient(XMPP_JID, XMPP_PASSWORD, BRIDGES)
-            if xmpp_client.connect((XMPP_SERVER, XMPP_PORT), use_ssl=False):
-                print(f"✅ [XMPP] Conectado: {XMPP_JID}")
-                await xmpp_client.process()
-            else:
-                print("❌ [XMPP] Falha ao conectar")
-                await asyncio.sleep(60)
-        except Exception as e:
-            print(f"❌ [XMPP] Erro: {e}")
-            await asyncio.sleep(60)
+    xmpp_client = XMPPClient(XMPP_JID, XMPP_PASSWORD, BRIDGES)
+
+    if not await xmpp_client.connect((XMPP_SERVER, XMPP_PORT)):
+        print("❌ Falha ao conectar ao XMPP")
+        return
+
+    print(f"✅ [XMPP] Conectado: {XMPP_JID}")
+    while xmpp_client.is_connected():
+        await asyncio.sleep(1)
+    print("❌ XMPP desconectado.")
 
 # ================== LOOP DE RECONEXÃO MATRIX ==================
 
@@ -1106,34 +958,26 @@ async def run_matrix_sync():
         try:
             matrix_client = await matrix_login()
             if not matrix_client:
-                print("⏳ [Matrix] Aguardando 60s para reconectar...")
                 await asyncio.sleep(60)
                 continue
 
-            # Registra callbacks
-            for ec in [RoomMessageText, RoomMessageEmote, RoomMessageNotice,
-                       RoomMessageMedia, RoomMessageFile, RoomMessageImage,
-                       RoomMessageVideo, RoomMessageAudio]:
+            for ec in [RoomMessageText, RoomMessageEmote, RoomMessageNotice, RoomMessageMedia, RoomMessageFile, RoomMessageImage, RoomMessageVideo, RoomMessageAudio]:
                 matrix_client.add_event_callback(matrix_message_callback, ec)
             matrix_client.add_event_callback(handle_matrix_redaction, RedactionEvent)
 
-            # Entra nas salas
             for bridge in BRIDGES:
-                try:
-                    await matrix_client.join(bridge['matrix_room'])
-                    print(f"✅ [Matrix] Entrou na sala: {bridge.get('name', bridge['matrix_room'])}")
-                except Exception as e:
-                    print(f"❌ [Matrix] Erro ao entrar na sala {bridge['matrix_room']}: {e}")
+                room_id = bridge.get('matrix_room')
+                if not room_id: continue
+                try: await matrix_client.join(room_id)
+                except Exception as e: print(f"❌ [Matrix] Erro ao entrar na sala {room_id}: {e}")
 
             state = load_state()
             sync_token = state.get('sync_token')
-            print("🔄 [Matrix] Iniciando sync_forever...")
             await matrix_client.sync_forever(timeout=30000, since=sync_token)
 
         except asyncio.CancelledError:
             break
         except Exception as e:
-            print(f"❌ [Matrix] Erro no sync: {e}. Reconectando em 60s...")
             if matrix_client:
                 await matrix_client.close()
                 matrix_client = None
@@ -1142,35 +986,26 @@ async def run_matrix_sync():
 # ================== MAIN ==================
 
 async def main():
-    # Inicia Discord
     discord_task = asyncio.create_task(discord_client.start(DISCORD_TOKEN))
 
-    # Inicia Telegram
     await telegram_app.initialize()
     await telegram_app.updater.start_polling()
     await telegram_app.start()
-    print("✅ [Telegram] OK")
 
-    # Inicia Matrix
     matrix_task = asyncio.create_task(run_matrix_sync())
-
-    # Inicia XMPP
     xmpp_task = asyncio.create_task(run_xmpp_client())
 
     try:
         await asyncio.gather(discord_task, matrix_task, xmpp_task)
     except KeyboardInterrupt:
-        print("🛑 Interrompido pelo usuário")
+        pass
     finally:
         if matrix_client and matrix_client.next_batch:
             state = load_state()
             state['sync_token'] = matrix_client.next_batch
             save_state(state)
-            print("💾 [Matrix] Sync_token salvo")
-        if matrix_client:
-            await matrix_client.close()
-        if xmpp_client and xmpp_client.is_connected():
-            xmpp_client.disconnect()
+        if matrix_client: await matrix_client.close()
+        if xmpp_client and xmpp_client.is_connected(): xmpp_client.disconnect()
         await telegram_app.updater.stop()
         await telegram_app.stop()
         await telegram_app.shutdown()
