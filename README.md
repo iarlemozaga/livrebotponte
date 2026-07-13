@@ -1,6 +1,6 @@
 # Livre Bot Ponte
-- Bot de ponte entre Matrix, Discord e Telegram
-- Relay bot between Matrix, Discord and Telegram
+- Bot de ponte entre Matrix, Discord, Telegram e Xmpp
+- Relay bot between Matrix, Discord,Telegram and Xmpp
 
 - OBS: A sala não pode estar com a criptografia ativada na sala da matrix
 - NOTE: The room cannot have encryption enabled in the matrix's room
@@ -9,9 +9,10 @@
 
 - [Docker](https://docs.docker.com/get-docker/) e [Docker Compose](https://docs.docker.com/compose/install/) (recomendado) **ou** Python 3.11+.
 - Contas e permissões nas plataformas:
-  - **Matrix**: Uma conta de usuário (pode ser secundária) que será o bot. Ela deve ser convidada para as salas que deseja conectar.
+  - **Matrix**: Uma conta de usuário (pode ser secundária) que será o bot.
   - **Discord**: Um bot com token e permissões para ler/enviar mensagens e mídia nos canais.
   - **Telegram**: Um bot (via @BotFather) com token e permissão para enviar mensagens nos grupos.
+  - **Xmpp**: Uma conta de usuário (pode ser secundária) que será o bot.
  
     OBS: Você não precisa ter a ponte nos 3 serviços ao mesmo tempo.
 
