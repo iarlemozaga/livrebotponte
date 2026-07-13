@@ -392,7 +392,7 @@ async def matrix_message_callback(room: MatrixRoom, event: RoomMessage):
         sender = get_matrix_display_name(room, event.sender)
 
         for ch_id in bridge.get('discord_channels', []):
-            await send_discord_edit(ch_id, targets.get('discord'), f"**{sender}:** {new_body}")
+            await send_discord_edit(ch_id, targets.get('discord'), new_body)
         for tg_id in bridge.get('telegram_chats', []):
             await send_telegram_edit(tg_id, targets.get('telegram'), f"<b>{escape_html(sender)}:</b> {escape_html(new_body)}")
         for xmpp_room in bridge.get('xmpp_rooms', []):
@@ -420,14 +420,13 @@ async def matrix_message_callback(room: MatrixRoom, event: RoomMessage):
             if final_path:
                 file_path = Path(final_path)
                 filename = file_path.name
-                text_to_send = f"**{sender_display}:** {body_text}" if body_text and body_text != filename_raw else f"**{sender_display}** enviou um arquivo"
+                text_to_send = body_text if body_text and body_text != filename_raw else "enviou um arquivo"
             else:
-                text_to_send = f"**{sender_display}** enviou mídia (falha download)"; file_path = None
+                text_to_send = "enviou mídia (falha download)"; file_path = None
     else:
-        text_to_send = f"**{sender_display}:** {body_text}"
+        text_to_send = body_text
 
     discord_text = f"{fallback_quote}{text_to_send}"
-    xmpp_text = f"{fallback_quote}{text_to_send}"
     sent_mappings = {}
 
     for ch_id in bridge.get('discord_channels', []):
@@ -447,12 +446,12 @@ async def matrix_message_callback(room: MatrixRoom, event: RoomMessage):
             if file_path and file_path.exists():
                 with open(file_path, 'rb') as f:
                     method = get_telegram_media_method(content_type)
-                    if method == 'send_photo': sent = await telegram_bot.send_photo(chat_id=tg_id, photo=f, caption=markdown_to_html(text_to_send), parse_mode=ParseMode.HTML, **kwargs)
-                    elif method == 'send_video': sent = await telegram_bot.send_video(chat_id=tg_id, video=f, caption=markdown_to_html(text_to_send), parse_mode=ParseMode.HTML, **kwargs)
-                    elif method == 'send_audio': sent = await telegram_bot.send_audio(chat_id=tg_id, audio=f, caption=markdown_to_html(text_to_send), parse_mode=ParseMode.HTML, **kwargs)
-                    else: sent = await telegram_bot.send_document(chat_id=tg_id, document=f, caption=markdown_to_html(text_to_send), parse_mode=ParseMode.HTML, **kwargs)
+                    if method == 'send_photo': sent = await telegram_bot.send_photo(chat_id=tg_id, photo=f, caption=markdown_to_html(f"<b>{sender_display}:</b> {body_text}"), parse_mode=ParseMode.HTML, **kwargs)
+                    elif method == 'send_video': sent = await telegram_bot.send_video(chat_id=tg_id, video=f, caption=markdown_to_html(f"<b>{sender_display}:</b> {body_text}"), parse_mode=ParseMode.HTML, **kwargs)
+                    elif method == 'send_audio': sent = await telegram_bot.send_audio(chat_id=tg_id, audio=f, caption=markdown_to_html(f"<b>{sender_display}:</b> {body_text}"), parse_mode=ParseMode.HTML, **kwargs)
+                    else: sent = await telegram_bot.send_document(chat_id=tg_id, document=f, caption=markdown_to_html(f"<b>{sender_display}:</b> {body_text}"), parse_mode=ParseMode.HTML, **kwargs)
             else:
-                sent = await telegram_bot.send_message(chat_id=tg_id, text=markdown_to_html(text_to_send), parse_mode=ParseMode.HTML, **kwargs)
+                sent = await telegram_bot.send_message(chat_id=tg_id, text=markdown_to_html(f"<b>{sender_display}:</b> {body_text}"), parse_mode=ParseMode.HTML, **kwargs)
             if sent: sent_mappings['telegram'] = sent.message_id
         except Exception: pass
 
@@ -631,7 +630,7 @@ async def telegram_message_handler(update: Update, context):
         except Exception: pass
 
     for ch_id in bridge.get('discord_channels', []):
-        discord_text = f"{fallback_quote}**{author}:** {body}" if body else f"{fallback_quote}**{author}** enviou mídia"
+        discord_text = f"{fallback_quote}{body}" if body else f"{fallback_quote}enviou mídia"
         try:
             if file_path and file_path.exists():
                 with open(file_path, 'rb') as f:
@@ -729,7 +728,7 @@ class BridgeXMPPClient(slixmpp.ClientXMPP):
             except Exception: pass
 
         for ch_id in bridge.get('discord_channels', []):
-            discord_text = f"{fallback_quote}**{sender}:** {body}" if body else f"{fallback_quote}**{sender}** enviou mídia"
+            discord_text = f"{fallback_quote}{body}" if body else f"{fallback_quote}enviou mídia"
             try:
                 if file_path and file_path.exists():
                     with open(file_path, 'rb') as f:
