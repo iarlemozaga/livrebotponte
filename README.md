@@ -96,3 +96,21 @@ NOTE: You don't need to have the bridge on all 3 services at the same time.
 
 1. docker compose build --no-cache
 2. docker compose up -d
+
+
+# Docker compose with docker hub image
+
+
+services:
+  livrebotponte:
+    image: iarle/livrebotponte:latest
+    container_name: livrebotponte
+    restart: unless-stopped
+    volumes:
+      - ./last_ts.txt:/app/last_ts.txt
+      - ./data:/app/data
+      - ./config.json:/app/config.json
+      - ./bot_state.json:/app/bot_state.json
+      - ./message_map.json:/app/message_map.json
+    environment:
+      - TZ=America/Sao_Paulo
